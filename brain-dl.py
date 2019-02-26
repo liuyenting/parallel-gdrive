@@ -164,11 +164,13 @@ def download_link(url, dst_dir, n_workers):
     with open(file_id_fn, 'r') as fd:
         file_ids = [line.strip() for line in fd.readlines()]
 
+    # create worker pool
     def init_worker():
         signal.signal(signal.SIGINT, signal.SIG_IGN)
+    pool = Pool(n_workers, init_worker)
+    logger.info("launched {} workers".format(n_workers))
 
     # download
-    pool = Pool(n_workers, init_worker)
     try:
         func = partial(download_file_id, dst_dir=dst_dir)
         with tqdm(
