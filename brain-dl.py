@@ -10,6 +10,7 @@ import signal
 import time
 from tqdm import tqdm
 
+import click
 import coloredlogs
 import httplib2
 from pydrive.auth import AuthenticationError, GoogleAuth, RefreshError
@@ -52,20 +53,6 @@ class TqdmToLogger(io.StringIO):
         self.logger.log(self.level, self.buf)
 
 tqdm_out = TqdmToLogger(logger, level=logging.INFO)
-
-gauth = GoogleAuth()
-
-# method 1 - service account
-#scope = ['https://www.googleapis.com/auth/drive.file']
-#gauth.credentials = SAC.from_json_keyfile_name('client_secret.json', scope)
-
-# method 2 - oauth
-auth_url = gauth.GetAuthUrl()
-print("Please visit\n\n{}\n\nto retrieve OAuth authorization code.".format(auth_url))
-code = input(".. CODE: ")
-gauth.Auth(code)
-
-drive = GoogleDrive(gauth)
 
 def download_file(fo, dst_dir=''):
     fn = fo['title']
@@ -119,14 +106,43 @@ def find_file_id(url, pattern=r'https://drive.google.com/drive/folders/(.*)$'):
     except AttributeError:
         raise ValueError("unable to determine file id")
 
-def init_worker():
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+def retrieve_file_ids(drive, file_id, save_as=None):
+    logger.info("no known ID list, scanning...")
 
-if __name__ == '__main__':
-    url = 'https://drive.google.com/drive/folders/1RCp0wZN-cik3QxRhy9L6r2ZSXjfHaPXa'
-    dst_dir = "~/nas/archive/ytliu"
-    n_workers = 8
+    # scheduler for progress reminder
+    s = sched.scheduler(time.time, time.sleep)
+    def action(i, fd):
+        fd.flush()
+        logger.info("found {} files".format(i))
 
+    # get id list
+    file_list = scan_for_files(drive, file_id)
+    if save_as:
+        with open(save_as, 'w') as fd:
+            i = 0
+            for fo in file_list:
+                fd.write("{}\n".format(fo['id']))
+                i += 1
+        
+                if s.empty():
+                    s.enter(5, 1, action, (i, fd))
+                s.run(blocking=False)
+    else:
+        file_ids = []
+        for fo in file_list:
+            file_ids.append(fo)
+            
+            if s.empty():
+                s.enter(5, 1, action, (i, fd))
+            s.run(blocking=False)
+
+        return file_id
+
+@click.command()
+@click.argument('url')
+@click.argument('dst_dir')
+@click.option('-n', '--n_workers', default=12, help='number of greetings')
+def download_link(url, dst_dir, n_workers):
     # target
     file_id = find_file_id(url)
 
@@ -138,42 +154,48 @@ if __name__ == '__main__':
         logger.info("destination \"{}\" created".format(dst_dir))
     except:
         pass
+    
+    # buffer to file
+    file_id_fn = 'id_{}.txt'.format(file_id)
+    if not os.path.exists(file_id_fn):
+        retrieve_file_ids(drive, file_id, save_as=file_id_fn)
 
-    # scheduler
-    s = sched.scheduler(time.time, time.sleep)
-    def action(i, fd):
-        fd.flush()
-        logger.info("found {} files".format(i))
+    # load id list
+    with open(file_id_fn, 'r') as fd:
+        file_ids = [line.strip() for line in fd.readlines()]
 
-    if not os.path.exists('id.txt'):
-        # get id list
-        file_list = scan_for_files(drive, file_id)
-        with open('id.txt', 'w') as fd:
-            i = 0
-            for fo in file_list:
-                fd.write("{}\n".format(fo['id']))
-                i += 1
-        
-                if s.empty():
-                   s.enter(5, 1, action, (i, fd))
-                s.run(blocking=False)
-    else:
-        # load id list
-        with open('id.txt', 'r') as fd:
-            file_ids = [line.strip() for line in fd.readlines()]
-        
-        # download
-        pool = Pool(n_workers, init_worker)
-        try:
-            func = partial(download_file_id, dst_dir=dst_dir)
-            with tqdm(
-                total=len(file_ids), mininterval=5,
-                file=tqdm_out
-            ) as pbar:
-                for _ in tqdm(pool.imap_unordered(func, file_ids)):
-                    pbar.update()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            pool.terminate()
-            pool.join()
+    def init_worker():
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    # download
+    pool = Pool(n_workers, init_worker)
+    try:
+        func = partial(download_file_id, dst_dir=dst_dir)
+        with tqdm(
+            total=len(file_ids), mininterval=5,
+            file=tqdm_out
+        ) as pbar:
+            for _ in tqdm(pool.imap_unordered(func, file_ids)):
+                pbar.update()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        pool.terminate()
+        pool.join()
+
+if __name__ == '__main__':
+    gauth = GoogleAuth()
+
+    # method 1 - service account
+    #scope = ['https://www.googleapis.com/auth/drive.file']
+    #gauth.credentials = SAC.from_json_keyfile_name('client_secret.json', scope)
+
+    # method 2 - oauth
+    auth_url = gauth.GetAuthUrl()
+    print("Please visit\n\n{}\n\nto retrieve OAuth authorization code.".format(auth_url))
+    code = input(".. CODE: ")
+    gauth.Auth(code)
+
+    drive = GoogleDrive(gauth)
+
+    download_link()
